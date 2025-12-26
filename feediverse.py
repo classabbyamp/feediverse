@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-
+from collections import defaultdict
+import json
 import os
 import re
 import yaml
@@ -15,17 +16,21 @@ from mastodon import Mastodon
 from datetime import datetime, timezone, MINYEAR
 
 DEFAULT_CONFIG_FILE = os.path.join("~", ".feediverse")
+DEFAULT_STATE_FILE = os.path.join("~", ".feediverse_state")
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--dry-run", action="store_true",
                         help=("perform a trial run with no changes made: "
-                              "don't toot, don't save config"))
+                              "don't toot, don't save state"))
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="be verbose")
     parser.add_argument("-c", "--config",
                         help="config file to use",
                         default=os.path.expanduser(DEFAULT_CONFIG_FILE))
+    parser.add_argument("-s", "--state",
+                        help="file to use to track state",
+                        default=os.path.expanduser(DEFAULT_STATE_FILE))
     parser.add_argument("-d", "--delay", action="store_true",
                         help="delay randomly from 10 to 30 seconds between each post")
     parser.add_argument("-p", "--dedupe",
@@ -34,15 +39,18 @@ def main():
 
     args = parser.parse_args()
     config_file = args.config
+    state_file = args.state
     dedupe_field = args.dedupe
 
     if args.verbose:
         print("using config file", config_file)
+        print("using state file", state_file)
 
     if not os.path.isfile(config_file):
-        setup(config_file)
+        setup(config_file, state_file)
 
     config = read_config(config_file)
+    state = read_state(state_file)
 
     masto = Mastodon(
         api_base_url=config['url'],
@@ -51,12 +59,12 @@ def main():
         access_token=config['access_token']
     )
 
-    newest_post = config['updated']
-    dupes = config['dupecheck']
     for feed in config['feeds']:
+        newest_post = state['updated'][feed["url"]]
+        dupes = state['dupecheck'][feed["url"]]
         if args.verbose:
-            print(f"fetching {feed['url']} entries since {config['updated']}")
-        for entry in get_feed(feed['url'], config['updated']):
+            print(f"fetching {feed['url']} entries since {newest_post}")
+        for entry in get_feed(feed['url'], newest_post):
             newest_post = max(newest_post, entry['updated'])
             entry_text = feed['template'].format(**entry)[:499]
 
@@ -73,7 +81,7 @@ def main():
                         print(f"Skipping dupe post: {entry_text} based on dedupe field {dedupe_field}")
                     continue
                 update_dupes(dupes, entry[dedupe_field])
-           
+
             image_medias = []
             if feed.get('include_images', False) and entry['images']:
                 for image in entry['images'][:4]:
@@ -92,10 +100,10 @@ def main():
                 print("Delaying..." + str(delay) + " seconds...")
                 time.sleep(delay)
 
-    if not args.dry_run:
-        config['updated'] = newest_post.isoformat()
-        config['dupecheck'] = dupes
-        save_config(config, config_file)
+        if True: #not args.dry_run:
+            state['updated'][feed["url"]] = newest_post
+            state['dupecheck'] = dupes
+            save_state(state, state_file)
 
 def get_feed(feed_url, last_update):
     feed = feedparser.parse(feed_url)
@@ -114,7 +122,7 @@ def get_feed(feed_url, last_update):
         yield get_entry(entry)
 
 def update_dupes(dupes, new):
-   if len(dupes) > 10:
+   if len(dupes) > 50:
      del dupes[0]
    dupes.append(new)
 
@@ -187,18 +195,33 @@ def save_config(config, config_file):
         fh.write(yaml.dump(copy, default_flow_style=False))
 
 def read_config(config_file):
-    config = {
-        'updated': datetime(MINYEAR, 1, 1, 0, 0, 0, 0, timezone.utc),
-        'dupecheck': [],
-    }
     with open(config_file) as fh:
-        cfg = yaml.load(fh, yaml.SafeLoader)
-        if 'updated' in cfg:
-            cfg['updated'] = dateutil.parser.parse(cfg['updated'])
-    config.update(cfg)
-    return config
+        return yaml.load(fh, yaml.SafeLoader)
 
-def setup(config_file):
+def save_state(state, state_file):
+    copy = dict(state)
+    copy["updated"] = {k: v.isoformat() for k, v in state["updated"].items()}
+    with open(state_file, 'w') as fh:
+        json.dump(copy, fh, indent=2)
+
+def read_state(state_file):
+    state = {
+        "updated": defaultdict(lambda: datetime(MINYEAR, 1, 1, 0, 0, 0, 0, timezone.utc)),
+        "dupecheck": defaultdict(list),
+    }
+    try:
+        with open(state_file) as fh:
+            st = json.load(fh)
+            if "updated" in st:
+                st["updated"] = {k: dateutil.parser.parse(v) for k, v in st["updated"].items()}
+                state["updated"].update(st["updated"])
+            if "dupecheck" in st:
+                state["dupecheck"].update(st["dupecheck"])
+    except FileNotFoundError:
+        pass
+    return state
+
+def setup(config_file, state_file):
     url = input('What is your Mastodon Instance URL? ')
     have_app = yes_no('Do you have your app credentials already?')
     if have_app:
@@ -233,9 +256,11 @@ def setup(config_file):
             {'url': feed_url, 'template': '{title} {url}', 'include_images': include_images}
         ]
     }
+    state = read_state(state_file)
     if not old_posts:
-        config['updated'] = datetime.now(tz=timezone.utc).isoformat()
+        state['updated'][feed_url] = datetime.now(tz=timezone.utc).isoformat()
     save_config(config, config_file)
+    save_state(state, state_file)
     print("")
     print("Your feediverse configuration has been saved to {}".format(config_file))
     print("Add a line line this to your crontab to check every 15 minutes:")
