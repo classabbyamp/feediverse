@@ -100,7 +100,7 @@ def main():
                 print("Delaying..." + str(delay) + " seconds...")
                 time.sleep(delay)
 
-        if True: #not args.dry_run:
+        if not args.dry_run:
             state['updated'][feed["url"]] = newest_post
             state['dupecheck'] = dupes
             save_state(state, state_file)
